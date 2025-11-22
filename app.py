@@ -1,120 +1,176 @@
-"""Simple Streamlit sales dashboard wireframe with mock data."""
+"""Mid-term S&OP Streamlit app."""
 
 from __future__ import annotations
 
-from datetime import date, timedelta
 from typing import Iterable, Tuple
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-
-def make_mock_data(rows: int = 300) -> pd.DataFrame:
-    """Create deterministic mock sales data for the demo dashboard."""
-    rng = np.random.default_rng(seed=42)
-    today = date.today()
-    start = today - timedelta(days=120)
-    dates = pd.date_range(start=start, end=today, freq="D")
-
-    regions = ["North", "South", "East", "West"]
-    products = ["Alpha", "Bravo", "Charlie", "Delta"]
-
-    data = {
-        "order_date": rng.choice(dates, size=rows),
-        "region": rng.choice(regions, size=rows),
-        "product": rng.choice(products, size=rows),
-        "units": rng.integers(1, 25, size=rows),
-        "unit_price": rng.uniform(20, 150, size=rows).round(2),
-    }
-    df = pd.DataFrame(data)
-    df["revenue"] = (df["units"] * df["unit_price"]).round(2)
-    return df.sort_values("order_date")
+from db import fetch_catalog, fetch_capacity, fetch_history, init_db
+from demand import build_demand_plan
+from inventory import plan_inventory
+from supply import build_supply_plan
 
 
 @st.cache_data(show_spinner=False)
-def load_data() -> pd.DataFrame:
-    return make_mock_data()
+def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Ensure the DB is initialized and fetch reference data."""
+    init_db()
+    history = fetch_history(months=18)
+    catalog = fetch_catalog()
+    capacity_map = fetch_capacity()
+    return history, catalog, capacity_map
 
 
-def filter_data(
-    df: pd.DataFrame,
-    date_range: Tuple[date, date],
-    regions: Iterable[str],
-    products: Iterable[str],
-) -> pd.DataFrame:
-    start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-    mask = (
-        (df["order_date"] >= start)
-        & (df["order_date"] <= end)
-        & (df["region"].isin(regions) if regions else True)
-        & (df["product"].isin(products) if products else True)
+def sidebar_controls(catalog: pd.DataFrame, regions: list[str]):
+    st.sidebar.header("Planning assumptions")
+    horizon = st.sidebar.slider("Planning horizon (months)", min_value=3, max_value=18, value=12, step=1)
+    sales_bias = st.sidebar.slider("Sales/marketing bias (%)", min_value=-10.0, max_value=25.0, value=5.0, step=0.5)
+    promo_lift = st.sidebar.slider("Near-term promo lift (%)", min_value=0.0, max_value=30.0, value=10.0, step=1.0)
+    service_level = st.sidebar.select_slider("Service level target", options=[0.90, 0.95, 0.98], value=0.95)
+    cover_months = st.sidebar.slider("Cycle + safety cover (months)", min_value=1.0, max_value=4.0, value=2.0, step=0.5)
+    capacity_buffer = st.sidebar.slider("Capacity headroom (%)", min_value=-10.0, max_value=30.0, value=10.0, step=1.0)
+    selected_products = st.sidebar.multiselect(
+        "Product focus", options=catalog["product"], default=catalog["product"].tolist()
     )
-    return df.loc[mask].copy()
+    selected_regions = st.sidebar.multiselect("Regions", options=regions, default=regions)
+    st.sidebar.caption("Adjust assumptions to see mid-term demand, inventory, and supply move together.")
+    return horizon, sales_bias, promo_lift, service_level, cover_months, capacity_buffer, selected_products, selected_regions
 
 
-def layout_sidebar(df: pd.DataFrame):
-    st.sidebar.header("Filters")
-    min_date, max_date = df["order_date"].min().date(), df["order_date"].max().date()
-    default_start = max_date - timedelta(days=60)
-    date_range = st.sidebar.date_input(
-        "Order date range", value=(default_start, max_date), min_value=min_date, max_value=max_date
+def filter_history(df: pd.DataFrame, products: Iterable[str], regions: Iterable[str]) -> pd.DataFrame:
+    filtered = df.copy()
+    if products:
+        filtered = filtered[filtered["product"].isin(products)]
+    if regions:
+        filtered = filtered[filtered["region"].isin(regions)]
+    return filtered
+
+
+def kpi_row(forecast_df: pd.DataFrame, inventory_df: pd.DataFrame, supply_df: pd.DataFrame):
+    demand_units = int(forecast_df["consensus_units"].sum()) if not forecast_df.empty else 0
+    revenue = forecast_df["revenue"].sum() if not forecast_df.empty else 0
+    inv_gap = int(inventory_df["projected_gap_units"].clip(lower=0).sum()) if not inventory_df.empty else 0
+    util = supply_df["utilization"].max() if not supply_df.empty else 0
+
+    st.subheader("Integrated S&OP pulse")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Consensus demand (units)", f"{demand_units:,}")
+    c2.metric("Revenue plan", f"${revenue:,.0f}")
+    c3.metric("Projected inv. gap", f"{inv_gap:,} units")
+    c4.metric("Peak utilization", f"{util:.0%}")
+
+
+def demand_section(history: pd.DataFrame, forecast_df: pd.DataFrame):
+    st.markdown("### Demand planning")
+    if history.empty and forecast_df.empty:
+        st.info("No data available for the selected filters.")
+        return
+
+    actual_monthly = history.groupby("month")["orders"].sum().reset_index(name="actual_orders")
+    forecast_monthly = (
+        forecast_df.groupby("month")["consensus_units"].sum().reset_index(name="consensus_forecast")
     )
-    selected_regions = st.sidebar.multiselect("Region", options=sorted(df["region"].unique()))
-    selected_products = st.sidebar.multiselect("Product", options=sorted(df["product"].unique()))
-    st.sidebar.caption("Adjust filters to see how KPIs and charts respond.")
-    return date_range, selected_regions, selected_products
+    timeline = pd.merge(actual_monthly, forecast_monthly, on="month", how="outer").sort_values("month")
+    timeline = timeline.set_index("month")
+    st.line_chart(timeline)
 
-
-def kpi_row(df: pd.DataFrame):
-    revenue = df["revenue"].sum()
-    units = df["units"].sum()
-    avg_ticket = revenue / len(df) if len(df) else 0
-    st.subheader("Key metrics")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Revenue", f"${revenue:,.0f}")
-    col2.metric("Units sold", f"{units:,}")
-    col3.metric("Avg order value", f"${avg_ticket:,.0f}")
-
-
-def charts(df: pd.DataFrame):
-    st.subheader("Sales trends")
-    daily = df.groupby("order_date")[["revenue", "units"]].sum().reset_index()
-    st.line_chart(daily.set_index("order_date"))
-
-    st.subheader("Revenue by region and product")
-    by_region = df.groupby("region")["revenue"].sum().sort_values(ascending=False)
-    by_product = df.groupby("product")["revenue"].sum().sort_values(ascending=False)
-    left, right = st.columns(2)
-    left.bar_chart(by_region)
-    right.bar_chart(by_product)
-
-
-def data_table(df: pd.DataFrame):
-    st.subheader("Order detail")
-    st.dataframe(
-        df.sort_values("order_date", ascending=False),
-        use_container_width=True,
-        hide_index=True,
+    by_product = (
+        forecast_df.groupby("product")[["consensus_units", "revenue"]]
+        .sum()
+        .sort_values("consensus_units", ascending=False)
     )
+    st.caption("Consensus forecast by product")
+    st.dataframe(by_product, use_container_width=True)
+
+
+def inventory_section(inventory_df: pd.DataFrame):
+    st.markdown("### Inventory planning")
+    if inventory_df.empty:
+        st.info("Inventory plan will appear once demand is available.")
+        return
+
+    chart_data = inventory_df.set_index("product")[["on_hand_units", "target_units", "safety_stock_units"]]
+    st.bar_chart(chart_data)
+    display = inventory_df[
+        ["product", "on_hand_units", "target_units", "safety_stock_units", "projected_gap_units", "months_of_cover"]
+    ].set_index("product")
+    st.dataframe(display, use_container_width=True)
+
+
+def supply_section(supply_df: pd.DataFrame):
+    st.markdown("### Supply planning")
+    if supply_df.empty:
+        st.info("Supply plan will appear once demand is available.")
+        return
+
+    avg_util = (
+        supply_df.groupby("site")["utilization"]
+        .mean()
+        .rename("avg_utilization")
+        .sort_values(ascending=False)
+    )
+    st.caption("Average utilization by site")
+    st.bar_chart(avg_util)
+
+    summary = supply_df.copy()
+    summary["month"] = summary["month"].dt.strftime("%b %Y")
+    summary["utilization"] = (summary["utilization"] * 100).round(1)
+    summary = summary[
+        ["month", "site", "planned_units", "capacity_units", "feasible_units", "shortfall_units", "utilization"]
+    ]
+    st.dataframe(summary, use_container_width=True, hide_index=True)
 
 
 def main():
     st.set_page_config(
-        page_title="Sales Insights (Mock)",
+        page_title="Mid-term S&OP",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    st.title("Sales Insights")
-    st.caption("Mock dashboard showing how sales data might be explored.")
+    st.title("Mid-term Sales & Operations Planning")
+    st.caption("Coordinate demand, inventory, and supply over a 3–18 month horizon.")
 
-    df = load_data()
-    date_range, regions, products = layout_sidebar(df)
-    filtered = filter_data(df, date_range, regions, products)
+    history, catalog, capacity_map = load_data()
+    regions = sorted(history["region"].unique().tolist())
+    (
+        horizon,
+        sales_bias,
+        promo_lift,
+        service_level,
+        cover_months,
+        capacity_buffer,
+        products,
+        selected_regions,
+    ) = sidebar_controls(catalog, regions)
+    filtered_history = filter_history(history, products, selected_regions)
 
-    kpi_row(filtered)
-    charts(filtered)
-    data_table(filtered)
+    forecast_df = build_demand_plan(
+        filtered_history,
+        horizon_months=horizon,
+        sales_bias_pct=sales_bias,
+        promo_lift_pct=promo_lift,
+        catalog_df=catalog,
+    )
+    inventory_df = plan_inventory(
+        forecast_df=forecast_df,
+        history=filtered_history,
+        service_level=service_level,
+        cover_months=cover_months,
+        catalog_df=catalog,
+    )
+    supply_df = build_supply_plan(
+        forecast_df=forecast_df,
+        capacity_buffer_pct=capacity_buffer,
+        capacity_by_site=capacity_map,
+        catalog_df=catalog,
+    )
+
+    kpi_row(forecast_df, inventory_df, supply_df)
+    demand_section(filtered_history, forecast_df)
+    inventory_section(inventory_df)
+    supply_section(supply_df)
 
 
 if __name__ == "__main__":
