@@ -46,3 +46,27 @@ def build_supply_plan(
         plan["capacity_units"] > 0, plan["planned_units"] / plan["capacity_units"], 0
     )
     return plan.sort_values(["month", "site"])
+
+
+def apply_supply_overrides(supply_df: pd.DataFrame, overrides_df: pd.DataFrame) -> pd.DataFrame:
+    """Replace planned units with planner-entered values, recalculating feasibility."""
+    if supply_df.empty or overrides_df.empty:
+        return supply_df
+
+    df = supply_df.copy()
+    overrides = overrides_df.copy()
+    overrides["month"] = pd.to_datetime(overrides["month"])
+    merged = df.merge(
+        overrides[["month", "site", "planned_units"]],
+        on=["month", "site"],
+        how="left",
+        suffixes=("", "_override"),
+    )
+    merged["planned_units"] = merged["planned_units_override"].combine_first(merged["planned_units"])
+    merged = merged.drop(columns=["planned_units_override"])
+    merged["feasible_units"] = np.minimum(merged["planned_units"], merged["capacity_units"])
+    merged["shortfall_units"] = (merged["planned_units"] - merged["feasible_units"]).clip(lower=0)
+    merged["utilization"] = np.where(
+        merged["capacity_units"] > 0, merged["planned_units"] / merged["capacity_units"], 0
+    )
+    return merged.sort_values(["month", "site"])

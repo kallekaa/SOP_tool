@@ -69,3 +69,21 @@ def build_demand_plan(
 
     df = pd.DataFrame(records)
     return df.sort_values(["month", "product", "region"])
+
+
+def apply_overrides(forecast_df: pd.DataFrame, overrides_df: pd.DataFrame) -> pd.DataFrame:
+    """Replace consensus units with user-entered plan where available."""
+    if forecast_df.empty or overrides_df.empty:
+        return forecast_df
+
+    overrides = overrides_df.copy()
+    overrides["month"] = pd.to_datetime(overrides["month"])
+
+    merged = forecast_df.merge(
+        overrides[["month", "product", "region", "plan_units"]],
+        on=["month", "product", "region"],
+        how="left",
+    )
+    merged["consensus_units"] = merged["plan_units"].combine_first(merged["consensus_units"])
+    merged["revenue"] = (merged["consensus_units"] * merged["unit_price"]).round(2)
+    return merged.drop(columns=["plan_units"]).sort_values(["month", "product", "region"])

@@ -51,6 +51,7 @@ def plan_inventory(
         {
             "product": catalog.index,
             "on_hand_units": on_hand.astype(int),
+            "recommended_target_units": target.astype(int),
             "target_units": target.astype(int),
             "safety_stock_units": safety_stock.astype(int),
             "projected_gap_units": gap.astype(int),
@@ -59,3 +60,18 @@ def plan_inventory(
         }
     )
     return result
+
+
+def apply_inventory_overrides(inventory_df: pd.DataFrame, overrides_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply planner-set targets to inventory plan."""
+    if inventory_df.empty or overrides_df.empty:
+        return inventory_df
+
+    df = inventory_df.copy()
+    overrides = overrides_df.set_index("product")["target_units"]
+    df["target_units"] = df["product"].map(overrides).combine_first(df["target_units"]).round(0)
+    df["target_units"] = df["target_units"].fillna(0).astype(int)
+    df["projected_gap_units"] = (df["target_units"] - df["on_hand_units"]).astype(int)
+    df["months_of_cover"] = np.where(df["future_avg_units"] > 0, df["on_hand_units"] / df["future_avg_units"], 0)
+    df["months_of_cover"] = df["months_of_cover"].round(2)
+    return df
